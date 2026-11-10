@@ -24,16 +24,19 @@ Release binaries are published by the `Release` workflow for
 `cm-daemon` and can start the local SurrealDB service:
 
 ```bash
-curl -fsSL https://github.com/lvl73/codemaster/releases/latest/download/install.sh -o install.sh
+curl -fsSL https://github.com/lvl73/codemaster-dist/releases/latest/download/install.sh -o install.sh
 sudo sh install.sh
 ```
 
 The installer lets you choose how SurrealDB runs (docker compose, plain
 `docker run`, `podman`, or your own instance) and, in an interactive run, asks
-for the image, credentials and port; pressing Enter at the password prompt
-generates a random one. Flags and environment variables skip the corresponding
-question — required for non-interactive runs (`--yes`). `sh install.sh --help`
-lists everything:
+for the image, port and credentials; pressing Enter at the password prompt
+generates a random one. The managed instance is keyed by its port (container
+and volume `cm-surrealdb-<port>`), so several instances — or a dev stack and a
+user install — coexist on one machine; an already-initialized storage asks for
+its original password instead of silently rejecting a new one. Flags and
+environment variables skip the corresponding question — required for
+non-interactive runs (`--yes`). `sh install.sh --help` lists everything:
 
 ```bash
 # non-interactive example
