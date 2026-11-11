@@ -8,6 +8,11 @@
 # Podman or docker compose. No root is needed: the default prefix is a
 # writable directory already on PATH (~/.local/bin).
 #
+# The configuration file it leaves behind is the full template of the build:
+# [storage] with the coordinates the installer verified, [embeddings] when
+# the user enabled the channel interactively, and every remaining section at
+# its default (T173) — `cm config explain` shows what is actually in effect.
+#
 # Typical usage:
 #   curl -fsSL https://raw.githubusercontent.com/lvl73/codemaster-dist/master/install.sh -o install.sh
 #   sh install.sh
@@ -932,7 +937,10 @@ database = \"$(toml_escape "$DB_DATABASE")\"
     # umask before the file exists: the secret must never be visible in the
     # window between creation and chmod.
     ( umask 077
-      if [ -f "$cfg" ] && grep -qE '^\[storage(\.[^]]*)?\][[:space:]]*$' "$cfg"; then
+      # An existing file is *copied minus the replaced section*, never emptied:
+      # a config without [storage] yet still has to keep [daemon],
+      # [embeddings] and every comment it may hold.
+      if [ -f "$cfg" ]; then
           storage_without_section "$cfg" > "$tmp"
       else
           : > "$tmp"
@@ -971,6 +979,89 @@ storage_without_section() { # SRC (stdout)
         /^[[:space:]]*\[/                       { in_storage = 0 }
         !in_storage                              { print }
     ' "$1"
+}
+
+# The [embeddings] counterpart: the section ends at the next header or EOF,
+# everything else — comments included — is copied.
+embeddings_without_section() { # SRC (stdout)
+    awk '
+        /^\[embeddings(\.[^]]*)?\][[:space:]]*$/ { in_embeddings = 1; next }
+        /^[[:space:]]*\[/                         { in_embeddings = 0 }
+        !in_embeddings                            { print }
+    ' "$1"
+}
+
+# Asks for the essential embeddings settings (T173). The defaults are the
+# reference stack this project is tested against — llama.cpp serving bge-m3
+# with 1024-dim vectors — so pressing Enter through all three is a valid
+# answer for that setup. Everything else (batching, token budgets, retries)
+# stays at the model's defaults: the file is theirs to edit later.
+# Non-interactive runs are never asked: the channel stays off, as before.
+ask_embeddings_config() {
+    interactive || return 0
+    printf 'Enable embedding-based semantic search (a local OpenAI-compatible server, e.g. llama.cpp)? [y/N]: '
+    read -r ans
+    case "${ans:-n}" in
+        [yY]*) ;;
+        *) return 0 ;;
+    esac
+    printf 'Embeddings base_url [http://127.0.0.1:8081/v1]: '; read -r ans
+    EMB_URL=${ans:-http://127.0.0.1:8081/v1}
+    printf 'Embeddings model [bge-m3]: '; read -r ans
+    EMB_MODEL=${ans:-bge-m3}
+    printf 'Embeddings dimensions [1024]: '; read -r ans
+    EMB_DIM=${ans:-1024}
+    case "$EMB_DIM" in ''|*[!0-9]*) EMB_DIM=1024 ;; esac
+    write_embeddings_config
+    return 0
+}
+
+# Replaces the [embeddings] section the way [storage] is replaced: the
+# installer records what the user chose, preserves the rest of the file,
+# and keeps the owner-only mode because the same file holds the password.
+write_embeddings_config() {
+    cfg="$HOME_DIR/config.toml"
+    block="[embeddings]
+enabled = true
+provider = \"openai-compatible\"
+base_url = \"$(toml_escape "$EMB_URL")\"
+model = \"$(toml_escape "$EMB_MODEL")\"
+dimensions = $EMB_DIM
+"
+    tmp="$cfg.new.$$"
+    ( umask 077
+      # Same preservation rule as [storage]: copy the file minus the old
+      # [embeddings] section, never start from empty over an existing config.
+      if [ -f "$cfg" ]; then
+          embeddings_without_section "$cfg" > "$tmp"
+      else
+          : > "$tmp"
+      fi
+      printf '\n%s' "$block" >> "$tmp" ) || die "cannot write $tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$cfg" || die "cannot replace $cfg"
+    log "enabled embeddings: $EMB_MODEL ($EMB_DIM dims) at $EMB_URL"
+    return 0
+}
+
+# Grows config.toml into the full template of this build (T173): 'cm config
+# init --from-environment' re-renders the file from the configuration model,
+# keeping the loaded values ([storage], and [embeddings] when the user just
+# enabled it), so every key the daemon reads is visible with its default
+# instead of being guessed from docs. The old file goes to a timestamped
+# backup (SPEC-5 policy). A template problem must never break a working
+# installation: failure warns and leaves the coordinates file in place.
+expand_config_template() {
+    if [ ! -x "$PREFIX/cm" ]; then
+        log "warning: 'cm' is not executable yet; $HOME_DIR/config.toml keeps only what the installer wrote"
+        return 0
+    fi
+    if "$PREFIX/cm" config init --from-environment --force >/dev/null 2>&1; then
+        log "expanded $HOME_DIR/config.toml to the full template (every section, defaults inline)"
+    else
+        log "warning: 'cm config init' failed; the working config.toml is left as-is"
+    fi
+    return 0
 }
 
 # TOML basic-string escaping. A password containing a quote or a backslash is
@@ -1032,9 +1123,16 @@ if [ "$SKIP_RUN" = 1 ]; then
     pick_db_mode
     resolve_coordinates
     write_storage_config
+    ask_embeddings_config
+    expand_config_template
 else
     start_surreal
     write_storage_config
+    # The embeddings questions precede the daemon start on purpose: the
+    # daemon reads [embeddings] at startup, so a channel enabled here is
+    # live from the first index, not only after a restart.
+    ask_embeddings_config
+    expand_config_template
     log "starting daemon"
     # One call, no private wait loop. `cm daemon start` owns the bounded wait for
     # the first health answer (SPEC-4) and, if the daemon dies, reports the
@@ -1054,6 +1152,8 @@ CodeMaster installed. Next steps in a project directory:
   cm init && cm index        # first full index
 If the database already hosts several projects, index needs the target:
   cm index --project <UUID>  # UUID is printed by cm init
+All configuration keys and defaults are inline in $HOME_DIR/config.toml;
+  cm config explain          # prints what is actually in effect and from where
 
 Anything unreachable? 'cm doctor' reads this machine — configuration, the
 [storage] coordinates, the database port, the daemon and the binaries — and exits
