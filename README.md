@@ -17,16 +17,55 @@ The product is not intended to replace source files, compilers, tests, debuggers
 - Quality metrics are measurements with declared algorithms and limitations, not an opaque universal quality score.
 - Indexing breadth and depth are configurable independently, including Git history.
 
-## Install (Ubuntu/macOS)
+## Install (Linux, and macOS from source)
 
-Release binaries are published by the `Release` workflow for
-`x86_64/aarch64` Linux and macOS. One command installs `cm`, `cm-mcp`,
+Requirements for the published binaries: Linux on `x86_64` or `aarch64` with
+**glibc >= 2.35** (Ubuntu 22.04, Debian 12; the builds in fact need only 2.34) —
+the release baseline of
+[ADR-0026](docs/adr/0026-linux-baseline-glibc-2-35.md) — plus Docker, Podman or
+your own SurrealDB 4.0.0 for the database. `cm doctor --deep` checks the
+installation, the coordinates, the database port and whether these binaries
+actually run here.
+
+Release binaries are published for Linux `x86_64` and `aarch64`; the macOS legs
+are parked (the repository currently has no macOS runners), so on macOS build
+from source with `--from-source`. One command installs `cm`, `cm-mcp`,
 `cm-daemon` and can start the local SurrealDB service:
 
 ```bash
-curl -fsSL https://github.com/lvl73/codemaster-dist/releases/latest/download/install.sh -o install.sh
-sudo sh install.sh
+curl -fsSL https://raw.githubusercontent.com/lvl73/codemaster-dist/master/install.sh -o install.sh
+sh install.sh
 ```
+
+Run it as the user who will use CodeMaster — **no `sudo`**. The installer picks a
+writable directory that is already on `PATH` (`~/.local/bin` by default);
+`/usr/local/bin` is used only for a root install or after an explicit
+confirmation. A `sudo` install is legitimate but shared: the daemon, its socket,
+`config.toml` and the staged skills belong to the home of the user who ran it,
+so `/root/.codemaster` is invisible to your own `cm`, which then reports the
+daemon as unavailable. The installer warns when it is started as root.
+
+What the installer decides on its own:
+
+- **OS, CPU and C library** (`uname` plus `ldd`/musl probes) select the asset
+  `cm-<triple>.tar.gz`. A host the release does not cover is refused with the
+  concrete alternatives (`--from-source`, `--triple`, `--libc`,
+  `--allow-unsupported`) instead of installing a binary whose only output is a
+  loader error.
+- **glibc baseline**: published builds target glibc >= 2.35 (Ubuntu 22.04,
+  Debian 12); an older host is refused before download, and `--min-glibc`
+  changes the contract.
+- **Checksums**: every downloaded asset (binaries and skills) is verified
+  against its published `.sha256`; a missing checksum aborts the install unless
+  `--allow-unverified` is given.
+- **It runs what it downloaded**: `cm --version` is executed from the temporary
+  directory before anything reaches `PATH`, so a wrong CPU, a wrong libc or a
+  missing shared library fails during installation, not on every later call.
+- **PATH**: when the install directory is not yet on `PATH`, `--path` appends a
+  marked block to the startup file of your shell (`~/.bashrc`, `~/.zshrc`,
+  `~/.profile`) — idempotently; without `--path` nothing is edited outside the
+  install directory and the installer prints the exact `export` line. `--no-path`
+  forbids touching a dotfile.
 
 The installer lets you choose how SurrealDB runs (docker compose, plain
 `docker run`, `podman`, or your own instance) and, in an interactive run, asks
@@ -61,6 +100,37 @@ The release flow is reproducible locally before publishing; the Makefile
 targets and assets are documented in
 [`docs/reference/release-flow.md`](docs/reference/release-flow.md).
 
+## Configuration
+
+Everything lives in `$CODEMASTER_HOME` (default `~/.codemaster`) and belongs to
+the user who runs `cm`:
+
+| Path | What |
+|---|---|
+| `config.toml` | the configuration; written by `install.sh`, mode `0600` (it holds the database password) |
+| `docker-compose.yml` | the managed SurrealDB instance, in `--db compose` mode |
+| `daemon.sock`, `daemon.lock` | the running daemon's IPC socket and single-owner lock |
+| `logs/daemon.log` | daemon log — `cm daemon start` quotes its last lines when the daemon dies |
+| `skills/` | staged agent skills + `skills-manifest.json` |
+
+Three commands answer everything about it:
+
+```bash
+cm config explain   # every effective value + where it came from (file/env/default), secrets redacted
+cm config init      # write a template of every key this build reads (coordinates left empty)
+cm doctor           # local report: configuration, permissions, database reachability, daemon state
+```
+
+**There is no built-in database address or credential**
+([ADR-0027](docs/adr/0027-no-builtin-database-coordinates.md)): all five
+`[storage]` coordinates must be set before the daemon starts, and until then
+`cm daemon start` says exactly which keys are missing instead of contacting a
+guessed port. `install.sh` writes the section for you; a scripted run passes
+`--user`/`--password` explicitly. An unset key that nobody wrote is reported by
+`cm doctor` as `storage_not_configured`, and a key that this build does not know
+(such as a typo) is reported as `unknown_key` with the nearest sibling —
+`docs/architecture/configuration.md` is the reference.
+
 ## Agent skills
 
 CodeMaster ships portable skills (`cm-explore`, `cm-impact`, `cm-debug`,
@@ -78,51 +148,4 @@ cm skill remove --agent opencode                           # deletes only our fi
 
 Scope is never guessed: non-interactively `cm skill install` requires both
 `--agent` and `--scope` and otherwise refuses, so CI and agents cannot write
-into places nobody chose. Verified target layouts, install guarantees, and the
-`codex`/`AGENTS.md` exception are documented in
-[`docs/architecture/agent-interfaces.md`](docs/architecture/agent-interfaces.md) §4.
-
-## Development
-
-The pipeline is end to end: `cm index` / `cm sync` build the index from the
-worktree (Tree-sitter grammars for Rust, Python, Go, PHP, JS/TS, including
-Vue/React fragments; LSP enrichment where available), and the same indexed
-facts answer queries through `cm search`, `cm symbol`, `cm context`,
-`cm unresolved`, `cm graph` (callers, callees, implementations, impact),
-`cm quality` (hotspots, metrics, explain), `cm dataflow` (sources, traces to
-sinks), `cm git` (history, changes, blame, co-change), and the knowledge
-family `cm tests` / `cm deps` / `cm coverage` / `cm architecture`. CLI, MCP
-(`cm-mcp`, stdio) and the read-only web admin (`cm-admin`) call the same
-application use cases. `cm status` / `cm overview` report index freshness and
-capabilities honestly, including partial states.
-
-The workspace is split into `crates/*` (domain, application, config, rpc,
-storage, daemon, cli, mcp, indexer, parsers, lsp, git, dataflow, admin);
-crate boundaries and forbidden dependency directions are fixed by ADR-0015
-and enforced by architecture fitness tests.
-
-Milestone content, decomposition and status live in the beads tracker;
-[`docs/implementation/roadmap.md`](docs/implementation/roadmap.md) is only a
-pointer to it. Architectural decisions and their consequences are recorded in
-[`docs/adr/`](docs/adr/); when implementation changes a decision, update the
-relevant ADR and documentation in the same change.
-
-Toolchain: Rust 1.99.1 is pinned in `rust-toolchain.toml`; the workspace MSRV is
-1.95 because SurrealDB 4.0 depends on `sysinfo` 0.39. See
-[`docs/adr/0017-rust-toolchain-and-surrealdb-pin.md`](docs/adr/0017-rust-toolchain-and-surrealdb-pin.md).
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build --workspace --bins --locked
-cargo test --workspace --locked
-
-# Local smoke test (Unix)
-docker compose up -d surrealdb
-export CODEMASTER_HOME="$(mktemp -d)"
-cargo run -p cm-cli -- daemon start
-cargo run -p cm-cli -- daemon status
-cargo run -p cm-cli -- init
-cargo run -p cm-cli -- status
-cargo run -p cm-cli -- daemon stop
-```
+into places nobody chose.
