@@ -12,6 +12,8 @@
 # [storage] with the coordinates the installer verified, [embeddings] when
 # the user enabled the channel interactively, and every remaining section at
 # its default (T173) — `cm config explain` shows what is actually in effect.
+# The one exception is [admin]: a debug surface (ADR-0018) the template
+# announces as a commented note but never writes live at its defaults.
 #
 # Typical usage:
 #   curl -fsSL https://raw.githubusercontent.com/lvl73/codemaster-dist/master/install.sh -o install.sh
@@ -1057,7 +1059,7 @@ expand_config_template() {
         return 0
     fi
     if "$PREFIX/cm" config init --from-environment --force >/dev/null 2>&1; then
-        log "expanded $HOME_DIR/config.toml to the full template (every section, defaults inline)"
+        log "expanded $HOME_DIR/config.toml to the full template (every operator section, defaults inline; [admin] stays a commented debug note)"
     else
         log "warning: 'cm config init' failed; the working config.toml is left as-is"
     fi
