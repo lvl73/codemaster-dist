@@ -79,6 +79,10 @@ SKIP_RUN=0
 FROM_SOURCE=0
 LOCAL_BIN=""
 NO_SKILLS=0
+NO_USAGE=0
+MERGE_TEMPLATE=0
+KEEP_CONFIG=0
+STORAGE_REUSED=0
 LOCAL_SKILLS=""
 SKILLS_SRC=""
 SKILLS_ASSET=cm-skills.tar.gz
@@ -128,6 +132,16 @@ Install:
   --local-skills DIR   take the portable agent skills from DIR instead of the
                        release asset (e.g. .agents/skills in a checkout)
   --no-skills          do not install agent skills at all (binaries only)
+  --no-usage           do not record local usage events ([usage] record=false;
+                       the table, reports and identity files stay unused —
+                       see ADR-0036; events never contain paths or query text)
+  --merge-template     instead of re-rendering config.toml, append only the
+                       keys it lacks (cm-config owns the merge; comments,
+                       order, unknown keys and [storage] stay untouched;
+                       second run = 0 changes)
+  --keep-config        never touch the configuration: reuse a working
+                       config.toml as it is (fails if doctor does not confirm
+                       it). A repeat run on a live install needs no answers
   --no-run             do not start SurrealDB or the daemon
   -y, --yes            non-interactive: accept defaults
   -h, --help           show this help
@@ -179,6 +193,9 @@ while [ $# -gt 0 ]; do
         --local-bin) LOCAL_BIN=$2; ASSET_NEEDED=0; shift 2 ;;
         --local-skills) LOCAL_SKILLS=$2; shift 2 ;;
         --no-skills) NO_SKILLS=1; shift ;;
+        --no-usage) NO_USAGE=1; shift ;;
+        --merge-template) MERGE_TEMPLATE=1; shift ;;
+        --keep-config) KEEP_CONFIG=1; shift ;;
         --no-run) SKIP_RUN=1; shift ;;
         -y|--yes) ASSUME_YES=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -303,6 +320,13 @@ detect_triple() {
             TRIPLE="$CPU-apple-darwin"
             ;;
         linux)
+            # ADR-0034: the aarch64 leg left the pipeline because its only
+            # verification was qemu user-mode emulation on an amd64 runner — an
+            # asset nobody had executed on the platform it claims to support.
+            # Say that here, at the machine that would otherwise download it.
+            if [ "$CPU" = aarch64 ]; then
+                asset_refuse "no aarch64 assets in this release (published for x86_64 only until 1.0, see docs/adr/0034)"
+            fi
             case "$LIBC" in
                 gnu) TRIPLE="$CPU-unknown-linux-gnu" ;;
                 musl) TRIPLE="$CPU-unknown-linux-musl" ;;
@@ -408,7 +432,7 @@ install_from_release() {
     TMPDIR_CM=$(mktemp -d)
     log "downloading $base/$asset"
     if ! fetch "$base/$asset" "$TMPDIR_CM/$asset"; then
-        die "no $asset in $REPO ($VERSION): ${FETCH_ERR:-not found}. Known assets are published for linux x86_64/aarch64; detected here: $OS $CPU/$LIBC. Options: --from-source, --repo, --triple"
+        die "no $asset in $REPO ($VERSION): ${FETCH_ERR:-not found}. Published assets cover linux x86_64/gnu and x86_64/musl (docs/adr/0034); detected here: $OS $CPU/$LIBC. Options: --from-source (builds for exactly this host), --repo, --triple"
     fi
     verify_checksum "$TMPDIR_CM" "$asset" "$base"
     tar -xzf "$TMPDIR_CM/$asset" -C "$TMPDIR_CM"
@@ -747,20 +771,30 @@ ask_db_params() {
     fi
     img_def=surrealdb/surrealdb:v4.0.0
     ns_def=codemaster; db_def=local
+    # An existing configuration is the default for an empty answer (T204):
+    # re-running the installer on a live machine must be Enter-Enter-Enter,
+    # not a re-interrogation. Values are read, never rewritten here — the
+    # writing stays in write_storage_config/cm-config (rule 3).
+    cur_endpoint=$(stored_value endpoint)
+    cur_user=$(stored_value username)
+    cur_namespace=$(stored_value namespace)
+    cur_database=$(stored_value database)
     if [ "$DB" = none ]; then
         if interactive; then
-            [ -n "$DB_ENDPOINT" ] || { printf 'Your SurrealDB endpoint host:port (no default): '
-                read -r DB_ENDPOINT; }
-            [ -n "$DB_USER" ] || { printf 'SurrealDB username (no default): '; read -r DB_USER; }
+            [ -n "$DB_ENDPOINT" ] || { printf 'Your SurrealDB endpoint host:port%s: ' \
+                    "${cur_endpoint:+ [$cur_endpoint]}"
+                read -r DB_ENDPOINT; DB_ENDPOINT=${DB_ENDPOINT:-$cur_endpoint}; }
+            [ -n "$DB_USER" ] || { printf 'SurrealDB username%s: ' "${cur_user:+ [$cur_user]}"
+                read -r DB_USER; DB_USER=${DB_USER:-$cur_user}; }
             [ -n "$DB_PASS" ] || { printf 'SurrealDB password for %s (no default): ' "${DB_USER:-?}"
                 read_secret DB_PASS; }
-            [ -n "$DB_NAMESPACE" ] || { printf 'Namespace [%s]: ' "$ns_def"
-                read -r DB_NAMESPACE; DB_NAMESPACE=${DB_NAMESPACE:-$ns_def}; }
-            [ -n "$DB_DATABASE" ] || { printf 'Database [%s]: ' "$db_def"
-                read -r DB_DATABASE; DB_DATABASE=${DB_DATABASE:-$db_def}; }
+            [ -n "$DB_NAMESPACE" ] || { printf 'Namespace [%s]: ' "${cur_namespace:-$ns_def}"
+                read -r DB_NAMESPACE; DB_NAMESPACE=${DB_NAMESPACE:-${cur_namespace:-$ns_def}}; }
+            [ -n "$DB_DATABASE" ] || { printf 'Database [%s]: ' "${cur_database:-$db_def}"
+                read -r DB_DATABASE; DB_DATABASE=${DB_DATABASE:-${cur_database:-$db_def}}; }
         fi
-        DB_NAMESPACE=${DB_NAMESPACE:-$ns_def}
-        DB_DATABASE=${DB_DATABASE:-$db_def}
+        DB_NAMESPACE=${DB_NAMESPACE:-${cur_namespace:-$ns_def}}
+        DB_DATABASE=${DB_DATABASE:-${cur_database:-$db_def}}
         require_credentials
         return 0
     fi
@@ -770,8 +804,10 @@ ask_db_params() {
         printf 'SurrealDB image [%s]: ' "$DB_IMAGE"; read -r ans
         [ -n "$ans" ] && DB_IMAGE=$ans
         if [ -z "$DB_PORT" ]; then
-            printf 'SurrealDB loopback port [8001]: '; read -r DB_PORT
-            DB_PORT=${DB_PORT:-8001}
+            port_def=${cur_endpoint##*:}
+            case "$port_def" in ''|*[!0-9]*) port_def=8001 ;; esac
+            printf 'SurrealDB loopback port [%s]: ' "$port_def"; read -r DB_PORT
+            DB_PORT=${DB_PORT:-$port_def}
         fi
     fi
     DB_PORT=${DB_PORT:-8001}
@@ -1058,12 +1094,44 @@ expand_config_template() {
         log "warning: 'cm' is not executable yet; $HOME_DIR/config.toml keeps only what the installer wrote"
         return 0
     fi
+    if [ "$MERGE_TEMPLATE" = 1 ]; then
+        # The merge is always attempted — it is exactly idempotent, so on a
+        # converged file it reports "0 keys" instead of hiding behind the
+        # doctor shortcut that governs the *storage* questions only.
+        local_out=$("$PREFIX/cm" config init --merge-template 2>&1)
+        if [ $? -eq 0 ]; then
+            case "$local_out" in
+            *"0 key"* | *"0 changes"*) printf 'cm-install: %s\n' "$local_out" ;;
+            *)
+                log "merged missing keys into $HOME_DIR/config.toml (existing values, comments and [storage] untouched)"
+                printf '%s\n' "$local_out" | sed -n 's/^config: added /  + /p'
+                ;;
+            esac
+        else
+            log "warning: 'cm config init --merge-template' failed; the working config.toml is left as-is"
+        fi
+        return 0
+    fi
     if "$PREFIX/cm" config init --from-environment --force >/dev/null 2>&1; then
         log "expanded $HOME_DIR/config.toml to the full template (every operator section, defaults inline; [admin] stays a commented debug note)"
     else
         log "warning: 'cm config init' failed; the working config.toml is left as-is"
     fi
     return 0
+}
+
+# Reads one key from the [storage] section of the installed config.toml
+# (read-only: the installer asks with the current value as the default,
+# T204). The value of a secret is never printed — only its presence gates
+# the question. Malformed files simply answer empty.
+stored_value() { # KEY (stdout)
+    [ -f "$HOME_DIR/config.toml" ] || return 0
+    awk -v key="$1" '
+        /^\[/{ in_storage = ($0 == "[storage]") ; next }
+        in_storage && $0 ~ "^" key "[ \t]*=" {
+            sub("^[^=]*=[ \t]*", ""); gsub(/^"|"$/, ""); gsub(/\\\"/, "\""); print; exit
+        }
+    ' "$HOME_DIR/config.toml"
 }
 
 # TOML basic-string escaping. A password containing a quote or a backslash is
@@ -1120,21 +1188,55 @@ install_binaries
 install_skills
 export CODEMASTER_HOME="$HOME_DIR"
 
+# --no-usage rides on the configuration, not on a shell-written section:
+# `cm config init --from-environment` renders [usage] record=false from this
+# variable (T200), so the schema stays single-sourced in cm-config (rule 3).
+if [ "$NO_USAGE" = 1 ]; then
+    export CODEMASTER_USAGE_RECORD=false
+fi
+
+# reuse-scan (T204): a config.toml whose every doctor check passes is the
+# installer's already-done work, but only an explicit --keep-config (never
+# touch the configuration) or --merge-template (grow it by missing keys,
+# keep everything else) opts into it. Without those flags the installer
+# behaves as before: it asks and re-renders, because a doctor-healthy file
+# may still be the file the operator came to change. A failed doctor under
+# --keep-config is an error, never a silent fallback to guessing.
+if [ "$KEEP_CONFIG" = 1 ] && [ ! -f "$HOME_DIR/config.toml" ]; then
+    die "--keep-config needs an existing $HOME_DIR/config.toml"
+fi
+if [ "$KEEP_CONFIG" = 1 ] || [ "$MERGE_TEMPLATE" = 1 ]; then
+    if [ -x "$PREFIX/cm" ] && "$PREFIX/cm" doctor --json >/dev/null 2>&1; then
+        STORAGE_REUSED=1
+        log "storage: reused, 0 changes (config.toml confirmed by cm doctor)"
+    elif [ "$KEEP_CONFIG" = 1 ]; then
+        die "--keep-config: cm doctor does not confirm the existing configuration"
+    fi
+fi
+
 if [ "$SKIP_RUN" = 1 ]; then
     log "--no-run: skipping SurrealDB and daemon startup"
-    pick_db_mode
-    resolve_coordinates
-    write_storage_config
-    ask_embeddings_config
-    expand_config_template
+    if [ "$STORAGE_REUSED" != 1 ]; then
+        pick_db_mode
+        resolve_coordinates
+        write_storage_config
+    fi
+    if [ "$KEEP_CONFIG" != 1 ]; then
+        ask_embeddings_config
+        expand_config_template
+    fi
 else
-    start_surreal
-    write_storage_config
+    if [ "$STORAGE_REUSED" != 1 ]; then
+        start_surreal
+        write_storage_config
+    fi
     # The embeddings questions precede the daemon start on purpose: the
     # daemon reads [embeddings] at startup, so a channel enabled here is
     # live from the first index, not only after a restart.
-    ask_embeddings_config
-    expand_config_template
+    if [ "$KEEP_CONFIG" != 1 ]; then
+        ask_embeddings_config
+        expand_config_template
+    fi
     log "starting daemon"
     # One call, no private wait loop. `cm daemon start` owns the bounded wait for
     # the first health answer (SPEC-4) and, if the daemon dies, reports the
