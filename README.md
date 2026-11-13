@@ -19,22 +19,23 @@ The product is not intended to replace source files, compilers, tests, debuggers
 
 ## Install (Linux, and macOS from source)
 
-Requirements for the published binaries: Linux on `x86_64` or `aarch64` with
-**glibc >= 2.35** (Ubuntu 22.04, Debian 12; the builds in fact need only 2.34) —
-the release baseline of
-[ADR-0026](docs/adr/0026-linux-baseline-glibc-2-35.md) — plus Docker, Podman or
-your own SurrealDB 4.0.0 for the database. `cm doctor --deep` checks the
-installation, the coordinates, the database port and whether these binaries
+Requirements for the published binaries: Linux on `x86_64` with **glibc >= 2.35**
+(Ubuntu 22.04, Debian 12; the builds in fact need only 2.34) — the release
+baseline of [ADR-0026](docs/adr-0026-linux-baseline-glibc-2-35.md) — plus Docker,
+Podman or your own SurrealDB 4.0.0 for the database. `cm doctor --deep` checks
+the installation, the coordinates, the database port and whether these binaries
 actually run here.
 
-Release binaries are published for Linux `x86_64` and `aarch64`; the macOS legs
-are parked (the repository currently has no macOS runners), so on macOS build
-from source with `--from-source`. One command installs `cm`, `cm-mcp`,
-`cm-daemon` and can start the local SurrealDB service:
+Release binaries are published for Linux `x86_64` only: the `aarch64` leg was
+parked until 1.0 because its only check was qemu emulation on an amd64 runner
+([ADR-0034](docs/adr/0034-release-assets-x86-64-only-until-1-0.md)), and the
+macOS legs are parked too (no macOS runners on the current plan). On either
+platform build for this host with `--from-source`. One command installs `cm`,
+`cm-mcp`, `cm-daemon` and can start the local SurrealDB service:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lvl73/codemaster-dist/master/install.sh -o install.sh
-sh install.sh
+sh install.sh --merge-template
 ```
 
 Run it as the user who will use CodeMaster — **no `sudo`**. The installer picks a
