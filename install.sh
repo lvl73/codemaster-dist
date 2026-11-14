@@ -1249,6 +1249,23 @@ else
     "$PREFIX/cm" --json status || true
 fi
 
+# The snippet survives a copy-paste only with absolute coordinates: --prefix and
+# --home accept relative paths, and a relative "command" would resolve against
+# whatever directory the agent happens to start the server in.
+ABS_PREFIX=$(cd "$PREFIX" 2>/dev/null && pwd) || ABS_PREFIX="$PREFIX"
+ABS_HOME=$(cd "$HOME_DIR" 2>/dev/null && pwd) || ABS_HOME="$HOME_DIR"
+
+# A non-default --home has to reach the adapter as well: install.sh wrote
+# config.toml under $HOME_DIR, and cm-mcp reads that home from its environment.
+# The line is emitted only when it differs from the default, so the common
+# snippet stays the shortest correct one.
+if [ "$ABS_HOME" = "${HOME%/}/.codemaster" ] || [ "$ABS_HOME" = "$(cd "$HOME" 2>/dev/null && pwd)/.codemaster" ]; then
+    MCP_HOME_LINES=""
+else
+    MCP_HOME_LINES="
+        \"environment\": { \"CODEMASTER_HOME\": \"$ABS_HOME\" },"
+fi
+
 cat <<EOF
 
 CodeMaster installed. Next steps in a project directory:
@@ -1263,12 +1280,30 @@ Anything unreachable? 'cm doctor' reads this machine — configuration, the
 [storage] coordinates, the database port, the daemon and the binaries — and exits
 non-zero only when something blocks work.
 
-Register the MCP server in agent configs, e.g. opencode.json:
+Register the MCP server with the agent's own tool, which preserves unrelated
+settings; for OpenCode that is:
+  opencode mcp add codemaster -- $ABS_PREFIX/cm-mcp            # this project
+  opencode mcp add codemaster --global -- $ABS_PREFIX/cm-mcp   # every project
+
+The entry must read in the native V2 shape — a server name directly under
+"mcp" and an "enabled" field are the V1 form, and "codemode": false is what
+puts the cm tools in the model's native list instead of behind Code Mode:
   "mcp": {
-    "codemaster": {
-      "type": "local",
-      "command": ["$PREFIX/cm-mcp"],
-      "enabled": true
+    "servers": {
+      "codemaster": {$MCP_HOME_LINES
+        "type": "local",
+        "command": ["$ABS_PREFIX/cm-mcp"],
+        "cwd": ".",
+        "codemode": false
+      }
     }
   }
+
+Verify from a project directory:
+  opencode mcp list          # expect: codemaster  connected
+  cm --json overview         # freshness, coverage and the next commands
+Config reloads without a restart ('/reload' forces it). In a new session ask
+the agent to list its "codemaster_" tools — with "codemode": false they are
+named one by one. "cwd" decides which repository a question is about: the
+adapter resolves the project from its own working directory, never by guess.
 EOF
