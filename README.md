@@ -20,60 +20,47 @@ The product is not intended to replace source files, compilers, tests, debuggers
 ## Install (Linux, and macOS from source)
 
 Requirements for the published binaries: Linux on `x86_64` with **glibc >= 2.35**
-(Ubuntu 22.04, Debian 12; the builds in fact need only 2.34) — the release
-baseline of [ADR-0026](docs/adr-0026-linux-baseline-glibc-2-35.md) — plus Docker,
+(Ubuntu 22.04, Debian 12) plus Docker,
 Podman or your own SurrealDB 4.0.0 for the database. `cm doctor --deep` checks
 the installation, the coordinates, the database port and whether these binaries
 actually run here.
 
-Release binaries are published for Linux `x86_64` only: the `aarch64` leg was
-parked until 1.0 because its only check was qemu emulation on an amd64 runner
-([ADR-0034](docs/adr/0034-release-assets-x86-64-only-until-1-0.md)), and the
-macOS legs are parked too (no macOS runners on the current plan). On either
+Release binaries are published for Linux `x86_64` only; on macOS or any other
 platform build for this host with `--from-source`. One command installs `cm`,
 `cm-mcp`, `cm-daemon` and can start the local SurrealDB service:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lvl73/codemaster-dist/master/install.sh -o install.sh
-sh install.sh --merge-template
+sh install.sh
 ```
 
-Run it as the user who will use CodeMaster — **no `sudo`**. The installer picks a
+Run it as the user who will use CodeMaster — **no `sudo`**. The daemon, its
+socket, `config.toml` and the staged skills live in the home of whoever ran the
+command, so a root install is invisible to your own `cm`. The installer picks a
 writable directory that is already on `PATH` (`~/.local/bin` by default);
 `/usr/local/bin` is used only for a root install or after an explicit
-confirmation. A `sudo` install is legitimate but shared: the daemon, its socket,
-`config.toml` and the staged skills belong to the home of the user who ran it,
-so `/root/.codemaster` is invisible to your own `cm`, which then reports the
-daemon as unavailable. The installer warns when it is started as root.
+confirmation.
 
 What the installer decides on its own:
 
-- **OS, CPU and C library** (`uname` plus `ldd`/musl probes) select the asset
-  `cm-<triple>.tar.gz`. A host the release does not cover is refused with the
-  concrete alternatives (`--from-source`, `--triple`, `--libc`,
-  `--allow-unsupported`) instead of installing a binary whose only output is a
+- **Platform and asset**: `uname` plus `ldd`/musl probes select
+  `cm-<triple>.tar.gz`; a host below the glibc baseline or outside the release
+  is refused with the concrete alternatives (`--from-source`, `--triple`,
+  `--libc`, `--allow-unsupported`) instead of a binary whose only output is a
   loader error.
-- **glibc baseline**: published builds target glibc >= 2.35 (Ubuntu 22.04,
-  Debian 12); an older host is refused before download, and `--min-glibc`
-  changes the contract.
-- **Checksums**: every downloaded asset (binaries and skills) is verified
-  against its published `.sha256`; a missing checksum aborts the install unless
-  `--allow-unverified` is given.
-- **It runs what it downloaded**: `cm --version` is executed from the temporary
-  directory before anything reaches `PATH`, so a wrong CPU, a wrong libc or a
-  missing shared library fails during installation, not on every later call.
-- **PATH**: when the install directory is not yet on `PATH`, `--path` appends a
-  marked block to the startup file of your shell (`~/.bashrc`, `~/.zshrc`,
-  `~/.profile`) — idempotently; without `--path` nothing is edited outside the
-  install directory and the installer prints the exact `export` line. `--no-path`
-  forbids touching a dotfile.
+- **Checksums**: every downloaded asset is verified against its published
+  `.sha256`; a missing checksum aborts unless `--allow-unverified` is given.
+- **It runs what it downloaded**: `cm --version` is executed before anything
+  reaches `PATH`, so a wrong CPU or libc fails during installation, not later.
+- **PATH**: with `--path` the install directory is added to your shell's
+  startup file idempotently; otherwise nothing outside the install directory
+  is edited and the exact `export` line is printed.
 
 The installer lets you choose how SurrealDB runs (docker compose, plain
 `docker run`, `podman`, or your own instance) and, in an interactive run, asks
 for the image, port and credentials; pressing Enter at the password prompt
-generates a random one. The managed instance is keyed by its port (container
-and volume `cm-surrealdb-<port>`), so several instances — or a dev stack and a
-user install — coexist on one machine; an already-initialized storage asks for
+generates a random one. Several instances — or a dev stack and a user install —
+coexist on one machine, keyed by port; an already-initialized storage asks for
 its original password instead of silently rejecting a new one. Flags and
 environment variables skip the corresponding question — required for
 non-interactive runs (`--yes`). `sh install.sh --help` lists everything:
@@ -94,8 +81,40 @@ section to `$CODEMASTER_HOME/config.toml`. After installation:
 cm init && cm index          # in a project directory
 ```
 
-and register `cm-mcp` as an MCP server in your agent config (the installer
-prints a ready-to-paste `opencode.json` snippet with the installed path).
+and register `cm-mcp` as an MCP server. Prefer the agent's own command, which
+keeps unrelated settings intact; the installer prints the same hint with the
+installed path:
+
+```bash
+opencode mcp add codemaster -- "$(command -v cm-mcp)"        # this project
+opencode mcp add codemaster --global -- "$(command -v cm-mcp)"
+```
+
+Then make sure the entry is in OpenCode's native V2 shape and that `codemode`
+is off — with the default `true` the cm tools are reachable only through Code
+Mode, not as `codemaster_*` tools the model can pick (the installer output
+carries the full snippet):
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "codemaster": {
+        "type": "local",
+        "command": ["/abs/path/to/cm-mcp"],
+        "cwd": ".",
+        "codemode": false
+      }
+    }
+  }
+}
+```
+
+Verify with `opencode mcp list` (`codemaster connected`) and, in a new session,
+by asking the agent to list its `codemaster_` tools. Configuration reloads
+without a restart. The adapter resolves the project from its working directory,
+so `cwd` decides which repository a question is about.
 
 The release flow is reproducible locally before publishing; the Makefile
 targets and assets are documented in
@@ -122,8 +141,8 @@ cm config init      # write a template of every key this build reads (coordinate
 cm doctor           # local report: configuration, permissions, database reachability, daemon state
 ```
 
-**There is no built-in database address or credential**
-([ADR-0027](docs/adr/0027-no-builtin-database-coordinates.md)): all five
+**There is no built-in database address or credential**:
+all five
 `[storage]` coordinates must be set before the daemon starts, and until then
 `cm daemon start` says exactly which keys are missing instead of contacting a
 guessed port. `install.sh` writes the section for you; a scripted run passes
@@ -142,11 +161,46 @@ Installing them into an agent is an explicit, separate action:
 
 ```bash
 cm skill list                                              # what is available
-cm skill install --agent opencode --scope project --yes
+cm skill install --agent opencode --scope project --yes --policy
 cm skill status --agent claude --scope global              # ok / modified / outdated
 cm skill remove --agent opencode                           # deletes only our files
+cm doctor --agent opencode                           # why the agent does not see cm
 ```
+
+One consented step further: `cm init --integration opencode --yes` performs
+the same pieces the separate commands own — skills, the policy block, the
+project MCP registration (`codemode: false`, strict-JSON merge) — records each
+in `.codemaster/integration.lock.json`, previews with `--dry-run`, and is
+reversible with `cm init --integration-remove`. `--with skills,policy,mcp-config,plugin`
+chooses the pieces explicitly; the reminder plugin changes the agent's own
+behaviour and is never installed by default. Plain `cm init`
+still installs nothing, so CI behaviour is unchanged. If the agent ends up not
+seeing cm, `cm doctor --agent opencode` names what is proven, what is missing,
+and what cm cannot observe from here.
+
+The reminder plugin nudges an agent back to cm after
+three consecutive grep/read/glob fallbacks — once per session, never blocking,
+and silent when no `codemaster_*` tools are visible to the model. To reproduce
+it in your own repository:
+
+```bash
+# from the project root, with the daemon running and the project registered
+cm init                                          # idempotent; registers if new
+cm init --integration opencode --with skills,policy,mcp-config,plugin --yes
+cm doctor --agent opencode                       # the plugin row must read ok
+```
+
+The plugin itself ships embedded in the `cm` binary — there is nothing to
+download. `--with plugin` writes it to `.opencode/plugins/codemaster-adopt/index.ts`,
+which OpenCode V2 discovers automatically (no config array needed); a file you
+edited is never overwritten. A new session is enough for OpenCode to pick it
+up. Silence the plugin without uninstalling: add `"-codemaster.adopt"` to
+`"plugins"` in `opencode.json`. Take everything back with
+`cm init --integration-remove`.
 
 Scope is never guessed: non-interactively `cm skill install` requires both
 `--agent` and `--scope` and otherwise refuses, so CI and agents cannot write
-into places nobody chose.
+into places nobody chose. `--policy` adds a short, always-loaded CodeMaster rule
+block to the project's `AGENTS.md`/`CLAUDE.md` (idempotent, removed by
+`cm skill remove`, your other text untouched); `--policy-only` installs just
+that block.
