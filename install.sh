@@ -133,8 +133,8 @@ Install:
                        release asset (e.g. .agents/skills in a checkout)
   --no-skills          do not install agent skills at all (binaries only)
   --no-usage           do not record local usage events ([usage] record=false;
-                       the table, reports and identity files stay unused —
-                       see ADR-0036; events never contain paths or query text)
+                       the table, reports and identity files stay unused;
+                       events never contain paths or query text)
   --merge-template     instead of re-rendering config.toml, append only the
                        keys it lacks (cm-config owns the merge; comments,
                        order, unknown keys and [storage] stay untouched;
@@ -149,7 +149,7 @@ Install:
 SurrealDB:
   --db MODE            auto|compose|docker|podman|none (default: prompt or auto)
   --image REF          SurrealDB image (env SURREALDB_IMAGE; interactive prompt
-                       defaults to surrealdb/surrealdb:v4.0.0, pinned by ADR-0017)
+                       defaults to surrealdb/surrealdb:v4.0.0)
   --user NAME          SurrealDB username (env SURREALDB_USER; asked interactively)
   --password PASS      SurrealDB password (env SURREALDB_PASSWORD; asked interactively,
                        empty answer = generated)
@@ -463,6 +463,13 @@ install_from_source() {
         cd "$TMPDIR_CM/repo"
     fi
     log "building release binaries (this can take a while)"
+    # T271: stamp the revision this build actually comes from. cm-buildinfo
+    # follows its own package, not HEAD — without this a dev install from a
+    # newer tree would keep the old +g<commit>, and the version-skew guard
+    # (beads T256) could not tell the new binaries from the running daemon.
+    # Environment precedence is the release-workflow channel of ADR-0033.
+    CM_BUILD_COMMIT=$(git rev-parse HEAD 2>/dev/null || true)
+    export CM_BUILD_COMMIT
     cargo build --release --locked -p cm-cli -p cm-mcp -p cm-daemon
     SRC_DIR=target/release
     SKILLS_SRC=.agents/skills
@@ -1035,8 +1042,15 @@ embeddings_without_section() { # SRC (stdout)
 # answer for that setup. Everything else (batching, token budgets, retries)
 # stays at the model's defaults: the file is theirs to edit later.
 # Non-interactive runs are never asked: the channel stays off, as before.
+# Reuse mode (--merge-template, T204): an existing [embeddings] section is
+# the installer's already-done work — asking there would offer to replace
+# whole section, so the question is skipped and stated.
 ask_embeddings_config() {
     interactive || return 0
+    if [ "$MERGE_TEMPLATE" = 1 ] && has_embeddings_section; then
+        log "embeddings: reused ([embeddings] present in $HOME_DIR/config.toml; not asked, not rewritten)"
+        return 0
+    fi
     printf 'Enable embedding-based semantic search (a local OpenAI-compatible server, e.g. llama.cpp)? [y/N]: '
     read -r ans
     case "${ans:-n}" in
@@ -1052,6 +1066,16 @@ ask_embeddings_config() {
     case "$EMB_DIM" in ''|*[!0-9]*) EMB_DIM=1024 ;; esac
     write_embeddings_config
     return 0
+}
+
+# True when config.toml already carries an [embeddings] section header
+# (reuse-scan companion of stored_value, same malformed-file silence).
+has_embeddings_section() {
+    [ -f "$HOME_DIR/config.toml" ] || return 1
+    awk '
+        /^\[/ { if ($0 == "[embeddings]") { found = 1; exit } }
+        END { exit !found }
+    ' "$HOME_DIR/config.toml"
 }
 
 # Replaces the [embeddings] section the way [storage] is replaced: the
@@ -1177,6 +1201,11 @@ warn_privileged_run
 preflight_runtimes
 if [ -n "$LOCAL_BIN" ]; then
     SRC_DIR=$LOCAL_BIN
+    # T271: prebuilt binaries carry whatever identity they were compiled with;
+    # an empty CM_BUILD_COMMIT at build time means the frozen one. Say it once.
+    log "note: --local-bin keeps the build-time identity; build with"
+    log "      CM_BUILD_COMMIT=\$(git rev-parse HEAD) cargo build --release ..."
+    log "      so cm --version and the skew guard name this revision"
 elif [ "$FROM_SOURCE" = 1 ]; then
     install_from_source
 else
@@ -1225,6 +1254,16 @@ if [ "$SKIP_RUN" = 1 ]; then
         ask_embeddings_config
         expand_config_template
     fi
+    # A skipped start must still catch the T256 trap: if a daemon from the
+    # PREVIOUS build owns the socket, every new client talks to it and every
+    # new feature looks broken. The CLI computes the verdict (`version_skew`
+    # in daemon status); this only prints it — no parsing of versions here.
+    SKEW=$("$PREFIX/cm" --json daemon status 2>/dev/null \
+        | sed -n 's/.*"version_skew": *"\([^"]*\)".*/\1/p')
+    if [ -n "$SKEW" ]; then
+        log "warning: $SKEW"
+        log "  fix: $PREFIX/cm daemon restart"
+    fi
 else
     if [ "$STORAGE_REUSED" != 1 ]; then
         start_surreal
@@ -1244,7 +1283,13 @@ else
     # that used to be here existed because the CLI gave up after 5 s on a fresh
     # database; it retried a failure that had already been decided, and its
     # timeout could not agree with the configuration.
-    "$PREFIX/cm" daemon start \
+    #
+    # --restart-on-skew (beads T256): an upgrade that only replaced binaries
+    # left the OLD daemon process owning the socket — the field session of
+    # 2026-11-14 measured a 0.4.1 client against a 0.4.0 server and read it
+    # as a regression of features that existed all along. An install IS the
+    # consent to run the installed build: restart the stale process.
+    "$PREFIX/cm" daemon start --restart-on-skew \
         || die "cm daemon start failed; the reason is printed above and recorded in $HOME_DIR/logs/daemon.log"
     "$PREFIX/cm" --json status || true
 fi
