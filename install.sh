@@ -30,6 +30,19 @@ set -eu
 # and the public distribution repository are different: assets and install.sh
 # are what a user downloads, and pointing this at a private repository makes
 # every external install fail with a 404 on the first request.
+# Repeat-install defaults (M17): every knob read below is an env var, and an
+# optional file can set them all at once, so a re-run is `sh install.sh --yes`
+# with no retyped flags. The file is sourced before the defaults are read —
+# exported like a shell profile would (`set -a`) — and real flags still win,
+# because the parser assigns after it. Absent file = today's behavior.
+INSTALL_ENV_FILE="${CM_INSTALL_ENV:-$HOME/.codemaster/install.env}"
+if [ -f "$INSTALL_ENV_FILE" ]; then
+    set -a
+    # shellcheck source=/dev/null
+    . "$INSTALL_ENV_FILE"
+    set +a
+fi
+
 REPO="${CM_REPO:-lvl73/codemaster-dist}"
 # --from-source needs the source repository, which is not the asset channel.
 SOURCE_REPO="${CM_SOURCE_REPO:-$REPO}"
@@ -74,13 +87,13 @@ VOL=""            # cm-surrealdb-<port>-data
 DB_EXPLICIT=0
 DOCKER_OK=0
 PODMAN_OK=0
-ASSUME_YES=0
+ASSUME_YES="${CM_ASSUME_YES:-0}"
 SKIP_RUN=0
-FROM_SOURCE=0
+FROM_SOURCE="${CM_FROM_SOURCE:-0}"
 LOCAL_BIN=""
 NO_SKILLS=0
 NO_USAGE=0
-MERGE_TEMPLATE=0
+MERGE_TEMPLATE="${CM_MERGE_TEMPLATE:-0}"
 KEEP_CONFIG=0
 STORAGE_REUSED=0
 LOCAL_SKILLS=""
@@ -128,6 +141,7 @@ Install:
   --repo SLUG          GitHub owner/repo of the release assets (env CM_REPO)
   --home PATH          CodeMaster home (default: ~/.codemaster or $CODEMASTER_HOME)
   --from-source        build with cargo instead of downloading release assets
+                       (env CM_FROM_SOURCE=1, or install.env below)
   --local-bin DIR      take binaries from DIR instead of downloading (advanced)
   --local-skills DIR   take the portable agent skills from DIR instead of the
                        release asset (e.g. .agents/skills in a checkout)
@@ -138,12 +152,12 @@ Install:
   --merge-template     instead of re-rendering config.toml, append only the
                        keys it lacks (cm-config owns the merge; comments,
                        order, unknown keys and [storage] stay untouched;
-                       second run = 0 changes)
+                       second run = 0 changes) (env CM_MERGE_TEMPLATE=1)
   --keep-config        never touch the configuration: reuse a working
                        config.toml as it is (fails if doctor does not confirm
                        it). A repeat run on a live install needs no answers
   --no-run             do not start SurrealDB or the daemon
-  -y, --yes            non-interactive: accept defaults
+  -y, --yes            non-interactive: accept defaults (env CM_ASSUME_YES=1)
   -h, --help           show this help
 
 SurrealDB:
@@ -160,6 +174,16 @@ SurrealDB:
   --endpoint HOST:PORT your own SurrealDB for --db none (env CM_STORAGE_ENDPOINT)
   --namespace NAME     storage namespace (env SURREALDB_NAMESPACE, prompt default: codemaster)
   --database NAME      storage database (env SURREALDB_DATABASE, prompt default: local)
+
+Repeat installs without retyping flags — put the stable choices in a file:
+  ~/.codemaster/install.env      (or point CM_INSTALL_ENV elsewhere)
+    CM_DB=compose
+    CM_FROM_SOURCE=1
+    CM_MERGE_TEMPLATE=1
+    CM_ASSUME_YES=1
+    SURREALDB_PORT=8001
+  sh install.sh            # then this single command is the whole install
+Flags override the file; the file never overrides a flag given on the line.
 
 Examples:
   sh install.sh                                   # interactive, no sudo needed
@@ -202,6 +226,10 @@ while [ $# -gt 0 ]; do
         *) die "unknown option: $1 (see --help)" ;;
     esac
 done
+
+# --from-source may also arrive through CM_FROM_SOURCE or install.env; the
+# flag branch clears ASSET_NEEDED inline, mirror that for the other channels.
+if [ "$FROM_SOURCE" = 1 ]; then ASSET_NEEDED=0; fi
 
 case "$DB" in
     ""|auto|compose|docker|podman|none) ;;
@@ -1324,6 +1352,15 @@ All configuration keys and defaults are inline in $HOME_DIR/config.toml;
 Anything unreachable? 'cm doctor' reads this machine — configuration, the
 [storage] coordinates, the database port, the daemon and the binaries — and exits
 non-zero only when something blocks work.
+
+Registration targets for 'cm init --integration <agent>' (beads T342):
+  opencode  claude  cursor  gemini-cli  deepseek-harness  (codex: advice only)
+Each writes its own config in the agent's own format — strict JSON files are
+merged key-by-key and never rewritten when they carry comments; the
+deepseek-harness target appends one insert entry to the machine patch layer
+\$DSH_HOME/cordis.patch.yml (default ~/.dsh). Everything applied is recorded
+in the project's integration lock and taken back by
+'cm init --integration-remove'.
 
 Register the MCP server with the agent's own tool, which preserves unrelated
 settings; for OpenCode that is:
