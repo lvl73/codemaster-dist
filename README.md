@@ -63,22 +63,41 @@ generates a random one. Several instances — or a dev stack and a user install 
 coexist on one machine, keyed by port; an already-initialized storage asks for
 its original password instead of silently rejecting a new one. Flags and
 environment variables skip the corresponding question — required for
-non-interactive runs (`--yes`). `sh install.sh --help` lists everything:
+non-interactive runs (`--yes`). `sh install.sh --help` lists everything.
+
+**First run** — answer the prompts once:
 
 ```bash
-# non-interactive example
-sh install.sh --yes --db docker --password "$(openssl rand -hex 16)" --port 8001
-# build from source instead of downloading release assets
-sh install.sh --from-source --db compose
+sh install.sh                        # interactive: db mode, port, password
+```
+
+**Every run after that** — put the stable choices in
+`~/.codemaster/install.env` (one `KEY=value` per line; flags still win):
+
+```bash
+CM_DB=compose          # or: docker | podman | none | from-source via CM_FROM_SOURCE=1
+CM_MERGE_TEMPLATE=1    # existing config.toml gains only the missing keys
+CM_ASSUME_YES=1        # nothing to prompt for
+SURREALDB_PORT=8001    # the port keys the managed instance
+```
+
+then the whole install is one command:
+
+```bash
+sh install.sh
 ```
 
 Defaults match `docker-compose.yml` in this repository: image
 `surrealdb/surrealdb:v4.0.0`, loopback port `8001`,
 namespace `codemaster`. Non-default credentials are appended as a `[storage]`
-section to `$CODEMASTER_HOME/config.toml`. After installation:
+section to `$CODEMASTER_HOME/config.toml`. After installation, in a project
+directory:
 
 ```bash
-cm init && cm index          # in a project directory
+cm init            # register this project (idempotent)
+cm index           # build the index
+cm status          # coverage, warnings, and the next command to run
+cm search "<name>" # first real question to the index
 ```
 
 and register `cm-mcp` as an MCP server. Prefer the agent's own command, which
@@ -115,6 +134,15 @@ Verify with `opencode mcp list` (`codemaster connected`) and, in a new session,
 by asking the agent to list its `codemaster_` tools. Configuration reloads
 without a restart. The adapter resolves the project from its working directory,
 so `cwd` decides which repository a question is about.
+
+The MCP surface is tiered (`[mcp] tools`, beads T337): by default a session
+sees the eight core tools (`investigate`, `search_code`, `get_symbol`,
+`graph_query`, `get_context`, `map`, `project_overview`, `get_index_status`)
+— the rest are real tools of the build, unlisted to keep the per-turn schema
+cost bounded. Set `tools = "full"` or `tools = ["architecture", "git_blame"]`
+(core plus the named extras) in `~/.codemaster/config.toml`, or in the
+repository's own `.codemaster/config.toml` — the one section a project may
+override. The CLI never hides: `cm --help` covers every surface from any tier.
 
 The release flow is reproducible locally before publishing; the Makefile
 targets and assets are documented in
@@ -171,14 +199,22 @@ One consented step further: `cm init --integration opencode --yes` performs
 the same pieces the separate commands own — skills, the policy block, the
 project MCP registration (`codemode: false`, strict-JSON merge) — records each
 in `.codemaster/integration.lock.json`, previews with `--dry-run`, and is
-reversible with `cm init --integration-remove`. `--with skills,policy,mcp-config,plugin`
+reversible with `cm init --integration-remove`. Registration targets
+(beads T342): `opencode`, `claude`, `cursor` (`.cursor/mcp.json`),
+`gemini-cli` (`.gemini/settings.json`) and `deepseek-harness`, which appends
+one `insert` entry mounting `@deepseek-ai/dsh-mcp-client` to the machine
+patch layer `$DSH_HOME/cordis.patch.yml`; `codex` answers with advice — cm
+never rewrites its TOML. Each target keeps the agent's own entry shape and
+the file's unrelated keys; skills and the policy block remain the three
+agents that have install targets, the rest is registration only.
+`--with skills,policy,mcp-config,plugin`
 chooses the pieces explicitly; the reminder plugin changes the agent's own
 behaviour and is never installed by default. Plain `cm init`
 still installs nothing, so CI behaviour is unchanged. If the agent ends up not
 seeing cm, `cm doctor --agent opencode` names what is proven, what is missing,
 and what cm cannot observe from here.
 
-The reminder plugin nudges an agent back to cm after
+The reminder plugin (beads T249, ADR-0040) nudges an agent back to cm after
 three consecutive grep/read/glob fallbacks — once per session, never blocking,
 and silent when no `codemaster_*` tools are visible to the model. To reproduce
 it in your own repository:
